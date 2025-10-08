@@ -8,7 +8,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
 try:
     # We need the queue objects to get their registries
-    from app_helper import redis_conn, rq_queue_high, rq_queue_default
+    from app_helper import redis_conn, rq_queue_high, rq_queue_default, rq_queue_track_analysis
 except ImportError as e:
     print(f"Error importing from app.py: {e}")
     print("Please ensure app.py is in the Python path and does not have top-level errors.")
@@ -18,7 +18,7 @@ logging.basicConfig(level=logging.INFO, format='[%(levelname)s]- %(message)s')
 
 if __name__ == '__main__':
     logging.info("🧹 RQ Janitor process starting. Cleaning registries every 10 seconds.")
-    queues_to_clean = [rq_queue_high, rq_queue_default]
+    queues_to_clean = [rq_queue_high, rq_queue_default, rq_queue_track_analysis]
     while True:
         try:
             for queue in queues_to_clean:

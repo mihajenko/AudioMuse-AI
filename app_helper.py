@@ -37,6 +37,7 @@ MAX_LOG_ENTRIES_STORED = 10 # Max number of recent log entries to store in the d
 redis_conn = Redis.from_url(REDIS_URL, socket_connect_timeout=15, socket_timeout=15)
 rq_queue_high = Queue('high', connection=redis_conn, default_timeout=-1) # High priority for main tasks
 rq_queue_default = Queue('default', connection=redis_conn, default_timeout=-1) # Default queue for sub-tasks
+rq_queue_track_analysis = Queue('inference', connection=redis_conn, default_timeout=-1) # Default queue for sub-tasks
 
 # --- Database Setup (PostgreSQL) ---
 def get_db():
@@ -288,6 +289,7 @@ def track_exists(item_id):
     cur.close()
     return row is not None
 
+
 def save_track_analysis_and_embedding(item_id, title, author, tempo, key, scale, moods, embedding_vector, energy=None, other_features=None):
     """Saves track analysis and embedding in a single transaction."""
     # Sanitize string inputs to remove NUL characters
@@ -298,7 +300,7 @@ def save_track_analysis_and_embedding(item_id, title, author, tempo, key, scale,
     other_features = other_features.replace('\x00', '') if other_features else other_features
 
     mood_str = ','.join(f"{k}:{v:.3f}" for k, v in moods.items())
-    
+
     conn = get_db() # This now calls the function within this file
     cur = conn.cursor()
     try:

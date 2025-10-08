@@ -40,7 +40,7 @@ app = Flask(__name__)
 # Import helper functions
 from app_helper import (
     init_db, get_db, close_db,
-    redis_conn, rq_queue_high, rq_queue_default,
+    redis_conn, rq_queue_high, rq_queue_default, rq_queue_track_analysis,
     clean_up_previous_main_tasks,
     save_task_status,
     get_task_info_from_db,
