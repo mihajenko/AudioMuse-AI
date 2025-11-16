@@ -269,7 +269,6 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
     except Exception as e_fallback:
         logger.error(f"Fallback loading method also failed for {os.path.basename(file_path)}: {e_fallback}")
         return None, None
-
     finally:
         # Clean up the temporary WAV file if it was created
         if temp_wav_path and os.path.exists(temp_wav_path):
@@ -542,7 +541,7 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 if not path:
                     continue
 
-                job_items = item, item_name, item_album_artist
+                job_items = item_id, item_name, item_album_artist
                 try:
                     job = rq_queue_track_analysis.enqueue(
                         "tasks.analysis.analyze_track",
@@ -575,17 +574,12 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                     )
                     continue
                 except RedisTimeoutError:
-                    logger.warning(
-                        f"Redis timeout while fetching job {job_id}. Will retry on next loop."
-                    )
+                    logger.warning(f"Redis timeout while fetching job {job_id}. Will retry on next loop.")
                     # We don't remove the job, we'll try fetching it again later.
                     active_inference_jobs[job_id] = job_items
                     continue
                 except Exception as e:  # Catch-all to avoid a single unexpected failure stopping the monitor loop.
-                    logger.warning(
-                        f"Unexpected error while fetching job {job_id}: {e}. Will retry on next loop.",
-                        exc_info=True,
-                    )
+                    logger.warning(f"Unexpected error while fetching job {job_id}: {e}. Will retry on next loop.", exc_info=True)
                     # Don't remove the job here because the fetch failed unexpectedly (network, auth, etc.).
                     active_inference_jobs[job_id] = job_items
                     continue
@@ -596,14 +590,12 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                     continue
 
                 # Persist job results
-                job, item_id, item_name, item_album_artist = job_items
+                item_id, item_name, item_album_artist = job_items
                 track_name_full = f"{item_name} by {item_album_artist}"
 
                 analysis, processed_embedding = result.return_value
                 if analysis is None:
-                    logger.warning(
-                        f"Skipping track {track_name_full} as analysis returned None."
-                    )
+                    logger.warning(f"Skipping track {track_name_full} as analysis returned None.")
                     tracks_skipped_count += 1
                     continue
 
@@ -615,25 +607,9 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 analysis_moods = analysis["moods"]
 
                 # Save the track analysis and embedding features
-                other_features = ",".join(
-                    [f"{k}:{analysis.get(k, 0.0):.2f}" for k in OTHER_FEATURE_LABELS]
-                )
-                moods_ranked = sorted(
-                    analysis_moods.items(), key=lambda i: i[1], reverse=True
-                )
-                top_moods = dict(moods_ranked[:top_n_moods])
-                save_track_analysis_and_embedding(
-                    item_id=item_id,
-                    title=item_name,
-                    author=item_album_artist,
-                    tempo=analysis_tempo,
-                    key=analysis_key,
-                    scale=analysis_scale,
-                    moods=top_moods,
-                    embedding_vector=processed_embedding,
-                    energy=analysis_energy,
-                    other_features=other_features,
-                )
+                top_moods = dict(sorted(analysis_moods.items(), key=lambda i: i[1], reverse=True)[:top_n_moods])
+                other_features = ",".join([f"{k}:{analysis.get(k, 0.0):.2f}" for k in OTHER_FEATURE_LABELS])
+                save_track_analysis_and_embedding(item_id, item_name, item_album_artist, analysis_tempo, analysis_key, analysis_scale, top_moods, processed_embedding, energy=analysis_energy, other_features=other_features)
 
                 logger.info(f"SUCCESSFULLY ANALYZED '{track_name_full}' (ID: {item_id}):")
                 logger.info(f"  - Tempo: {analysis_tempo:.2f}, Energy: {analysis_energy:.4f}, Key: {analysis_key} {analysis_scale}")

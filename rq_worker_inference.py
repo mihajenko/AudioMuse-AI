@@ -1,7 +1,6 @@
 # /home/guido/Music/AudioMuse-AI/rq_worker_high_priority.py
 import os
 import sys
-import logging
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 
@@ -16,10 +15,10 @@ except ImportError as e:
     sys.exit(1)
 
 # This worker ONLY listens to the 'high' queue.
-queues_to_listen = ['gpu']
+queues_to_listen = ['inference']
 
 if __name__ == '__main__':
-    print(f"🚀 DEDICATED GPU PRIORITY RQ Worker starting. Version: {APP_VERSION}. Listening ONLY on queues: {queues_to_listen}")
+    print(f"🚀 DEDICATED INFERENCE PRIORITY RQ Worker starting. Version: {APP_VERSION}. Listening ONLY on queues: {queues_to_listen}")
     print(f"Using Redis connection: {redis_conn.connection_pool.connection_kwargs}")
 
     worker = SimpleWorker(
