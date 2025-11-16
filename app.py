@@ -1,7 +1,7 @@
 import os
 import psycopg2
 from psycopg2.extras import DictCursor
-from flask import Flask, jsonify, request, render_template, g, current_app
+from flask import Flask, jsonify, request, render_template, g, current_app, url_for
 import json
 import logging
 import threading
@@ -15,24 +15,27 @@ from rq.exceptions import NoSuchJobError
 # Redis client
 from redis import Redis
 
-# Werkzeug import for reverse proxy support
-from werkzeug.middleware.proxy_fix import ProxyFix
-
 # Swagger imports
 from flasgger import Swagger, swag_from
 
 # Import configuration
 from config import JELLYFIN_URL, JELLYFIN_USER_ID, JELLYFIN_TOKEN, HEADERS, TEMP_DIR, \
-    REDIS_URL, DATABASE_URL, MAX_DISTANCE, MAX_SONGS_PER_CLUSTER, MAX_SONGS_PER_ARTIST, NUM_RECENT_ALBUMS, \
-    SCORE_WEIGHT_DIVERSITY, SCORE_WEIGHT_SILHOUETTE, SCORE_WEIGHT_DAVIES_BOULDIN, SCORE_WEIGHT_CALINSKI_HARABASZ, \
-    SCORE_WEIGHT_PURITY, SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY, SCORE_WEIGHT_OTHER_FEATURE_PURITY, \
-    MIN_SONGS_PER_GENRE_FOR_STRATIFICATION, STRATIFIED_SAMPLING_TARGET_PERCENTILE, \
-    CLUSTER_ALGORITHM, NUM_CLUSTERS_MIN, NUM_CLUSTERS_MAX, DBSCAN_EPS_MIN, DBSCAN_EPS_MAX, GMM_COVARIANCE_TYPE, \
-    DBSCAN_MIN_SAMPLES_MIN, DBSCAN_MIN_SAMPLES_MAX, GMM_N_COMPONENTS_MIN, GMM_N_COMPONENTS_MAX, \
-    SPECTRAL_N_CLUSTERS_MIN, SPECTRAL_N_CLUSTERS_MAX, ENABLE_CLUSTERING_EMBEDDINGS, \
-    PCA_COMPONENTS_MIN, PCA_COMPONENTS_MAX, CLUSTERING_RUNS, MOOD_LABELS, TOP_N_MOODS, APP_VERSION, \
-    AI_MODEL_PROVIDER, OLLAMA_SERVER_URL, OLLAMA_MODEL_NAME, GEMINI_API_KEY, GEMINI_MODEL_NAME, MISTRAL_MODEL_NAME, \
-    TOP_N_PLAYLISTS, PATH_DISTANCE_METRIC  # --- NEW: Import path distance metric ---
+  REDIS_URL, DATABASE_URL, MAX_DISTANCE, MAX_SONGS_PER_CLUSTER, MAX_SONGS_PER_ARTIST, NUM_RECENT_ALBUMS, \
+  SCORE_WEIGHT_DIVERSITY, SCORE_WEIGHT_SILHOUETTE, SCORE_WEIGHT_DAVIES_BOULDIN, SCORE_WEIGHT_CALINSKI_HARABASZ, \
+  SCORE_WEIGHT_PURITY, SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY, SCORE_WEIGHT_OTHER_FEATURE_PURITY, \
+  MIN_SONGS_PER_GENRE_FOR_STRATIFICATION, STRATIFIED_SAMPLING_TARGET_PERCENTILE, \
+  CLUSTER_ALGORITHM, NUM_CLUSTERS_MIN, NUM_CLUSTERS_MAX, DBSCAN_EPS_MIN, DBSCAN_EPS_MAX, GMM_COVARIANCE_TYPE, \
+  DBSCAN_MIN_SAMPLES_MIN, DBSCAN_MIN_SAMPLES_MAX, GMM_N_COMPONENTS_MIN, GMM_N_COMPONENTS_MAX, \
+  SPECTRAL_N_CLUSTERS_MIN, SPECTRAL_N_CLUSTERS_MAX, ENABLE_CLUSTERING_EMBEDDINGS, \
+  PCA_COMPONENTS_MIN, PCA_COMPONENTS_MAX, CLUSTERING_RUNS, MOOD_LABELS, TOP_N_MOODS, APP_VERSION, \
+  AI_MODEL_PROVIDER, OLLAMA_SERVER_URL, OLLAMA_MODEL_NAME, GEMINI_API_KEY, GEMINI_MODEL_NAME, MISTRAL_MODEL_NAME, \
+  TOP_N_PLAYLISTS, PATH_DISTANCE_METRIC, ALCHEMY_DEFAULT_N_RESULTS, ALCHEMY_MAX_N_RESULTS, ALCHEMY_SUBTRACT_DISTANCE, \
+  ENABLE_PROXY_FIX, \
+  ALCHEMY_SUBTRACT_DISTANCE_ANGULAR, ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN  # --- NEW: Import path distance metric and alchemy defaults ---
+
+if ENABLE_PROXY_FIX:
+  # Werkzeug import for reverse proxy support
+  from werkzeug.middleware.proxy_fix import ProxyFix
 
 # --- Flask App Setup ---
 app = Flask(__name__)
@@ -60,8 +63,8 @@ logging.basicConfig(
     datefmt='%d-%m-%Y %H-%M-%S' # Custom date/time format
 )
 
-app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
-# *** END OF FIX ***
+if ENABLE_PROXY_FIX:
+  app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 # Log the application version on startup
 app.logger.info(f"Starting AudioMuse-AI Backend version {APP_VERSION}")
@@ -107,7 +110,7 @@ def index():
             schema:
               type: string
     """
-    return render_template('index.html')
+    return render_template('index.html', title = 'AudioMuse-AI - Home Page', active='index')
 
 
 @app.route('/api/status/<task_id>', methods=['GET'])
@@ -470,6 +473,11 @@ def get_config_endpoint():
         "score_weight_other_feature_diversity": SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY,
         "score_weight_other_feature_purity": SCORE_WEIGHT_OTHER_FEATURE_PURITY,
         "path_distance_metric": PATH_DISTANCE_METRIC
+      ,"alchemy_default_n_results": ALCHEMY_DEFAULT_N_RESULTS
+      ,"alchemy_max_n_results": ALCHEMY_MAX_N_RESULTS
+      ,"alchemy_subtract_distance": ALCHEMY_SUBTRACT_DISTANCE
+      ,"alchemy_subtract_distance_angular": ALCHEMY_SUBTRACT_DISTANCE_ANGULAR
+      ,"alchemy_subtract_distance_euclid": ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN
     })
 
 @app.route('/api/playlists', methods=['GET'])
@@ -480,7 +488,7 @@ def get_playlists_endpoint():
     from collections import defaultdict # Local import if not used elsewhere globally
     conn = get_db()
     cur = conn.cursor(cursor_factory=DictCursor)
-    cur.execute("SELECT playlist_name, item_id, title, author FROM playlist ORDER BY playlist_name, title")
+    cur.execute("SELECT playlist_name, item_id, title, author FROM playlist ORDER BY playlist_name")
     rows = cur.fetchall()
     cur.close()
     playlists_data = defaultdict(list)
@@ -488,72 +496,130 @@ def get_playlists_endpoint():
         playlists_data[row['playlist_name']].append({"item_id": row['item_id'], "title": row['title'], "author": row['author']})
     return jsonify(dict(playlists_data)), 200
 
-def listen_for_index_reloads():
-    """
-    Runs in a background thread to listen for messages on a Redis Pub/Sub channel.
-    When a 'reload' message is received, it triggers the in-memory Voyager index to be reloaded.
-    This is the recommended pattern for inter-process communication in this architecture,
-    avoiding direct HTTP calls from workers to the web server.
-    """
-    # Create a new Redis connection for this thread.
-    # Sharing the main redis_conn object across threads is not recommended.
-    thread_redis_conn = Redis.from_url(REDIS_URL)
-    pubsub = thread_redis_conn.pubsub()
-    pubsub.subscribe('index-updates')
-    logger.info("Background thread started. Listening for Voyager index reloads on Redis channel 'index-updates'.")
 
-    for message in pubsub.listen():
-        # The first message is a confirmation of subscription, so we skip it.
-        if message['type'] == 'message':
-            message_data = message['data'].decode('utf-8')
-            logger.info(f"Received '{message_data}' message on 'index-updates' channel.")
-            if message_data == 'reload':
-                # We need the application context to access 'g' and the database connection.
-                with app.app_context():
-                    logger.info("Triggering in-memory Voyager index reload from background listener.")
-                    try:
-                        from tasks.voyager_manager import load_voyager_index_for_querying
-                        load_voyager_index_for_querying(force_reload=True)
-                        logger.info("In-memory Voyager index reloaded successfully by background listener.")
-                    except Exception as e:
-                        logger.error(f"Error reloading Voyager index from background listener: {e}", exc_info=True)
+# --- Redis index reload listener (restored pre-e308673 logic, with map reload added) ---
+def listen_for_index_reloads():
+  """
+  Runs in a background thread to listen for messages on a Redis Pub/Sub channel.
+  When a 'reload' message is received, it triggers the in-memory Voyager index and map to be reloaded.
+  This is the recommended pattern for inter-process communication in this architecture,
+  avoiding direct HTTP calls from workers to the web server.
+  """
+  # Create a new Redis connection for this thread.
+  # Sharing the main redis_conn object across threads is not recommended.
+  from redis import Redis
+  thread_redis_conn = Redis.from_url(REDIS_URL)
+  pubsub = thread_redis_conn.pubsub()
+  pubsub.subscribe('index-updates')
+  logger.info("Background thread started. Listening for Voyager index reloads on Redis channel 'index-updates'.")
+
+  for message in pubsub.listen():
+    # The first message is a confirmation of subscription, so we skip it.
+    if message['type'] == 'message':
+      message_data = message['data'].decode('utf-8')
+      logger.info(f"Received '{message_data}' message on 'index-updates' channel.")
+      if message_data == 'reload':
+        # We need the application context to access 'g' and the database connection.
+        with app.app_context():
+          logger.info("Triggering in-memory Voyager index and map reload from background listener.")
+          try:
+            from tasks.voyager_manager import load_voyager_index_for_querying
+            load_voyager_index_for_querying(force_reload=True)
+            from app_helper import load_map_projection
+            load_map_projection('main_map', force_reload=True)
+            # Rebuild the map JSON cache used by the /api/map endpoint
+            from app_map import build_map_cache
+            build_map_cache()
+            logger.info("In-memory Voyager index and map reloaded successfully by background listener.")
+          except Exception as e:
+            logger.error(f"Error reloading Voyager index or map from background listener: {e}", exc_info=True)
+
+
+
 
 
 # --- Import and Register Blueprints ---
 # This is the original, working structure.
 from app_helper import get_child_tasks_from_db, get_score_data_by_ids, get_tracks_by_ids, save_track_analysis_and_embedding, track_exists, update_playlist_table
 
+# Import tasks modules to ensure they're available to RQ workers
+import tasks.clustering
+import tasks.analysis
+
 
 from app_chat import chat_bp
 from app_clustering import clustering_bp
 from app_analysis import analysis_bp
+from app_cron import cron_bp, run_due_cron_jobs
 from app_voyager import voyager_bp
 from app_sonic_fingerprint import sonic_fingerprint_bp
 from app_path import path_bp
 from app_collection import collection_bp
 from app_external import external_bp # --- NEW: Import the external blueprint ---
-from app_universe import universe_bp # --- NEW: Import the universe blueprint ---
+from app_alchemy import alchemy_bp
+from app_map import map_bp
 
 app.register_blueprint(chat_bp, url_prefix='/chat')
 app.register_blueprint(clustering_bp)
 app.register_blueprint(analysis_bp)
+app.register_blueprint(cron_bp)
 app.register_blueprint(voyager_bp)
 app.register_blueprint(sonic_fingerprint_bp)
 app.register_blueprint(path_bp)
 app.register_blueprint(collection_bp)
 app.register_blueprint(external_bp, url_prefix='/external') # --- NEW: Register the external blueprint ---
-app.register_blueprint(universe_bp) # --- NEW: Register the universe blueprint ---
+app.register_blueprint(alchemy_bp)
+app.register_blueprint(map_bp)
 
 if __name__ == '__main__':
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    
-    with app.app_context():
-        # --- Initial Voyager Index Load ---
-        from tasks.voyager_manager import load_voyager_index_for_querying
-        load_voyager_index_for_querying()
+  os.makedirs(TEMP_DIR, exist_ok=True)
 
-    # --- Start Background Listener Thread ---
-    listener_thread = threading.Thread(target=listen_for_index_reloads, daemon=True)
-    listener_thread.start()
+  with app.app_context():
+    # --- Initial Voyager Index Load ---
+    from tasks.voyager_manager import load_voyager_index_for_querying
+    load_voyager_index_for_querying()
+    # Also try to load precomputed map projection into memory if available
+    try:
+      from app_helper import load_map_projection
+      load_map_projection('main_map')
+      logger.info("In-memory map projection loaded at startup.")
+    except Exception as e:
+      logger.debug(f"No precomputed map projection to load at startup or load failed: {e}")
+    # Initialize map JSON cache once at startup (reads DB one time)
+    # Run this in a background daemon thread so the Flask process doesn't block on the heavy DB read.
+    def _start_map_init_background():
+      try:
+        from app_map import init_map_cache
+        logger.info('Starting background map JSON cache build.')
+        # Ensure we run the heavy cache build inside an application context
+        with app.app_context():
+          init_map_cache()
+        logger.info('Background map JSON cache build finished.')
+      except Exception:
+        logger.exception('Background init_map_cache failed')
 
-    app.run(debug=False, host='0.0.0.0', port=8000)
+    t = threading.Thread(target=_start_map_init_background, daemon=True)
+    t.start()
+
+  # --- Start Background Listener Thread ---
+  listener_thread = threading.Thread(target=listen_for_index_reloads, daemon=True)
+  listener_thread.start()
+
+  # Start a cron manager thread that checks enabled cron entries every 60 seconds
+  def _cron_manager_loop():
+    try:
+      from time import sleep
+      while True:
+        try:
+          with app.app_context():
+            run_due_cron_jobs()
+        except Exception:
+          app.logger.exception('cron manager failed')
+        sleep(60)
+    except Exception:
+      app.logger.exception('cron manager main loop error')
+
+  cron_thread = threading.Thread(target=_cron_manager_loop, daemon=True)
+  cron_thread.start()
+
+  app.run(debug=False, host='0.0.0.0', port=8000)

@@ -1,56 +1,64 @@
 # tasks/analysis.py
 
-import json
-import logging
 import os
 import shutil
-import time
-import traceback
-import uuid
-from tempfile import NamedTemporaryFile
+from collections import defaultdict
 from typing import Literal
 
-import librosa
 import numpy as np
-import tensorflow.compat.v1 as tf
-from librosa import feature as librosa_feature
-from psycopg2 import OperationalError
+import json
+import time
+import random
+import logging
+import uuid
+import traceback
 from pydub import AudioSegment
-from redis.exceptions import TimeoutError as RedisTimeoutError  # Import with an alias
-from rq import Retry, get_current_job
-from rq.exceptions import NoSuchJobError
+from tempfile import NamedTemporaryFile
+
+import librosa
+import onnx
+import onnxruntime as ort
+
+from sklearn.metrics import silhouette_score, davies_bouldin_score, calinski_harabasz_score
+from sklearn.preprocessing import StandardScaler
+
+# RQ import
+from rq import get_current_job, Retry
 from rq.job import Job
-from tensorflow.core.framework import tensor_pb2
-from tensorflow.python.framework import tensor_util
+from rq.exceptions import NoSuchJobError
 
 # Import configuration from the user's provided config file
 from config import (
-    AGGRESSIVE_MODEL_PATH,
-    AUDIO_LOAD_TIMEOUT,  # Add this to your config.py, e.g., AUDIO_LOAD_TIMEOUT = 600 (for a 10-minute timeout)
-    DANCEABILITY_MODEL_PATH,
-    EMBEDDING_MODEL_PATH,
-    HAPPY_MODEL_PATH,
+    TEMP_DIR, MAX_DISTANCE, MAX_SONGS_PER_CLUSTER, MAX_SONGS_PER_ARTIST,
+    GMM_COVARIANCE_TYPE, MOOD_LABELS, EMBEDDING_MODEL_PATH, PREDICTION_MODEL_PATH, ENERGY_MIN, ENERGY_MAX,
+    TEMPO_MIN_BPM, TEMPO_MAX_BPM, JELLYFIN_URL, JELLYFIN_USER_ID, JELLYFIN_TOKEN, EMBY_URL, EMBY_USER_ID, EMBY_TOKEN, OTHER_FEATURE_LABELS, REDIS_URL, DATABASE_URL,
+    OLLAMA_SERVER_URL, OLLAMA_MODEL_NAME, AI_MODEL_PROVIDER, GEMINI_API_KEY, GEMINI_MODEL_NAME,
+    DANCEABILITY_MODEL_PATH, AGGRESSIVE_MODEL_PATH, HAPPY_MODEL_PATH, PARTY_MODEL_PATH, RELAXED_MODEL_PATH, SAD_MODEL_PATH,
+    SCORE_WEIGHT_SILHOUETTE, SCORE_WEIGHT_DAVIES_BOULDIN, SCORE_WEIGHT_CALINSKI_HARABASZ,
+    SCORE_WEIGHT_DIVERSITY, SCORE_WEIGHT_PURITY, SCORE_WEIGHT_OTHER_FEATURE_DIVERSITY, SCORE_WEIGHT_OTHER_FEATURE_PURITY,
+    MUTATION_KMEANS_COORD_FRACTION, MUTATION_INT_ABS_DELTA, MUTATION_FLOAT_ABS_DELTA,
+    TOP_N_ELITES, EXPLOITATION_START_FRACTION, EXPLOITATION_PROBABILITY_CONFIG, TOP_N_MOODS, TOP_N_OTHER_FEATURES,
+    STRATIFIED_GENRES, MIN_SONGS_PER_GENRE_FOR_STRATIFICATION, SAMPLING_PERCENTAGE_CHANGE_PER_RUN, ITERATIONS_PER_BATCH_JOB, MAX_CONCURRENT_BATCH_JOBS, REBUILD_INDEX_BATCH_SIZE,
     MAX_QUEUED_ANALYSIS_JOBS,
-    MOOD_LABELS,
-    OTHER_FEATURE_LABELS,
-    PARTY_MODEL_PATH,
-    PREDICTION_MODEL_PATH,
-    REBUILD_INDEX_BATCH_SIZE,
-    RELAXED_MODEL_PATH,
-    SAD_MODEL_PATH,
-    TEMP_DIR,
+    TOP_K_MOODS_FOR_PURITY_CALCULATION, LN_MOOD_DIVERSITY_STATS, LN_MOOD_PURITY_STATS,
+    LN_OTHER_FEATURES_DIVERSITY_STATS, LN_OTHER_FEATURES_PURITY_STATS,
+    STRATIFIED_SAMPLING_TARGET_PERCENTILE,
+    OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY as CONFIG_OTHER_FEATURE_PREDOMINANCE_THRESHOLD_FOR_PURITY,
+    AUDIO_LOAD_TIMEOUT # Add this to your config.py, e.g., AUDIO_LOAD_TIMEOUT = 600 (for a 10-minute timeout)
 )
-from tasks.mediaserver import (
-    download_track,
-    get_recent_albums,
-    get_tracks_from_album,
-)  # MODIFIED: The functions from mediaserver no longer need server-specific parameters.
-from tasks.voyager_manager import (
-    build_and_store_voyager_index,
-)  # MODIFIED: Import from voyager_manager instead of annoy_manager
 
-# Setup
-tf.disable_v2_behavior()  # Necessary for loading frozen graphs
+
+# Import other project modules
+from ai import get_ai_playlist_name, creative_prompt_template
+from .commons import score_vector
+# MODIFIED: Import from voyager_manager instead of annoy_manager
+from .voyager_manager import build_and_store_voyager_index
+# MODIFIED: The functions from mediaserver no longer need server-specific parameters.
+from .mediaserver import get_recent_albums, get_tracks_from_album, download_track
+
+
+from psycopg2 import OperationalError
+from redis.exceptions import TimeoutError as RedisTimeoutError # Import with an alias
 logger = logging.getLogger(__name__)
 
 # --- Tensor Name Definitions ---
@@ -58,19 +66,40 @@ logger = logging.getLogger(__name__)
 # this is the definitive mapping.
 DEFINED_TENSOR_NAMES = {
     # Takes spectrograms, outputs embeddings
-    "embedding": {"input": "model/Placeholder:0", "output": "model/dense/BiasAdd:0"},
+    'embedding': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/dense/BiasAdd:0'
+    },
     # Takes embeddings, outputs mood predictions
-    "prediction": {
-        "input": "serving_default_model_Placeholder:0",
-        "output": "PartitionedCall:0",
+    'prediction': {
+        'input': 'serving_default_model_Placeholder:0',
+        'output': 'PartitionedCall:0'
     },
     # Takes a single aggregated embedding, outputs a binary classification
-    "danceable": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
-    "aggressive": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
-    "happy": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
-    "party": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
-    "relaxed": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
-    "sad": {"input": "model/Placeholder:0", "output": "model/Softmax:0"},
+    'danceable': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    },
+    'aggressive': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    },
+    'happy': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    },
+    'party': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    },
+    'relaxed': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    },
+    'sad': {
+        'input': 'model/Placeholder:0',
+        'output': 'model/Softmax:0'
+    }
 }
 
 # --- Class Index Mapping ---
@@ -101,30 +130,61 @@ def clean_temp(temp_dir):
 
 # --- Core Analysis Functions ---
 
+def _find_onnx_name(candidate_name, names):
+    """Try several heuristics to match a TF-style tensor name to an ONNX input/output name."""
+    if candidate_name in names:
+        return candidate_name
+    # strip trailing :0
+    stripped = candidate_name.split(':')[0]
+    if stripped in names:
+        return stripped
+    # try last part after '/'
+    last = stripped.split('/')[-1]
+    if last in names:
+        return last
+    # try replacing '/' with '_'
+    alt = stripped.replace('/', '_')
+    if alt in names:
+        return alt
+    # fallback: return first name
+    return names[0] if names else None
 
-def run_inference(session, feed_dict, output_tensor_name):
-    """
-    Runs inference using the provided session and tensor names.
-    Handles multiple input tensors via the feed_dict.
-    """
-    graph = session.graph
-    logger.debug(
-        f"Running inference for output '{output_tensor_name}' with feed_dict keys: {list(feed_dict.keys())}"
-    )
+def run_inference(onnx_session, feed_dict, output_tensor_name=None):
+    """Run inference on an ONNX Runtime session.
 
-    final_feed_dict = {}
-    for tensor_name, value in feed_dict.items():
-        try:
-            tensor = graph.get_tensor_by_name(tensor_name)
-            final_feed_dict[tensor] = value
-        except KeyError:
-            logger.error(
-                f"Could not find tensor '{tensor_name}' in the current graph. Skipping."
-            )
+    onnx_session: ort.InferenceSession
+    feed_dict: dict mapping possible tensor names to numpy arrays
+    output_tensor_name: optional expected output name (TF-style). If None, use first output.
+    """
+    # Build input name -> value map for ONNX
+    input_meta = onnx_session.get_inputs()
+    input_names = [i.name for i in input_meta]
+    mapped = {}
+    logger.debug(f"ONNX session inputs: {input_names}")
+    for key, val in feed_dict.items():
+        onnx_name = _find_onnx_name(key, input_names)
+        if onnx_name is None:
+            logger.error(f"Could not map input name '{key}' to any ONNX input names: {input_names}")
             return None
+        mapped[onnx_name] = val
 
-    output_tensor = graph.get_tensor_by_name(output_tensor_name)
-    return session.run(output_tensor, feed_dict=final_feed_dict)
+    # Determine outputs
+    output_meta = onnx_session.get_outputs()
+    output_names = [o.name for o in output_meta]
+    logger.debug(f"ONNX session outputs: {output_names}")
+    if output_tensor_name:
+        onnx_output_name = _find_onnx_name(output_tensor_name, output_names)
+    else:
+        onnx_output_name = output_names[0] if output_names else None
+
+    if onnx_output_name is None:
+        logger.error("No ONNX output name available to run inference.")
+        return None
+
+    # Run and return numpy array
+    result = onnx_session.run([onnx_output_name], mapped)
+    # onnxruntime returns a list of outputs in the same order
+    return result[0] if isinstance(result, list) and len(result) > 0 else result
 
 
 def sigmoid(x):
@@ -138,26 +198,22 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
     results in an empty audio signal, it falls back to a more robust method
     using pydub (and ffmpeg) to convert the file to a temporary WAV before loading.
     """
-
+    audio = None
+    sr = None
+    
     # --- Primary Method: Direct Librosa Load ---
     try:
-        audio, sr = librosa.load(
-            file_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT
-        )
-
+        audio, sr = librosa.load(file_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT)
+        
         # An empty audio signal is a failure condition, so we raise an error to trigger the fallback.
         if audio is None or audio.size == 0:
             raise ValueError("Librosa returned an empty audio signal.")
-
-        logger.debug(
-            f"Successfully loaded {os.path.basename(file_path)} directly with Librosa."
-        )
+            
+        logger.debug(f"Successfully loaded {os.path.basename(file_path)} directly with Librosa.")
         return audio, sr
 
     except Exception as e_direct_load:
-        logger.warning(
-            f"Direct librosa load failed for {os.path.basename(file_path)}: {e_direct_load}. Attempting fallback conversion."
-        )
+        logger.warning(f"Direct librosa load failed for {os.path.basename(file_path)}: {e_direct_load}. Attempting fallback conversion.")
 
     # --- Fallback Method: Convert to WAV with pydub ---
     temp_wav_path = None
@@ -168,66 +224,50 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
             file_path,
             # Add parameters to help with codec detection issues
             parameters=[
-                "-analyzeduration",
-                "10M",  # Increase analysis duration
-                "-probesize",
-                "10M",  # Increase probe size
-                "-ignore_unknown",  # Ignore unknown streams
-                "-err_detect",
-                "ignore_err",  # Ignore decode errors
-            ],
+                "-analyzeduration", "10M",  # Increase analysis duration
+                "-probesize", "10M",        # Increase probe size  
+                "-ignore_unknown",          # Ignore unknown streams
+                "-err_detect", "ignore_err", # Ignore decode errors
+                "-ac", "2"                  # Force downmix to stereo to handle multichannel files
+            ]
         )
         if len(audio_segment) == 0:
-            logger.error(
-                f"Pydub loaded a zero-duration audio segment from {os.path.basename(file_path)}. The file is likely corrupt or empty."
-            )
+            logger.error(f"Pydub loaded a zero-duration audio segment from {os.path.basename(file_path)}. The file is likely corrupt or empty.")
             return None, None
 
         with NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav_file:
             temp_wav_path = temp_wav_file.name
-
+        
         # --- MEMORY OPTIMIZATION FOR LARGE FILES ---
         # Resample and convert to mono during export to create a much smaller temp file.
         # This is critical for handling very large source files without running out of memory.
-        logger.info(
-            f"Fallback: Pre-processing {os.path.basename(file_path)} to a smaller WAV for safe loading..."
-        )
+        logger.info(f"Fallback: Pre-processing {os.path.basename(file_path)} to a smaller WAV for safe loading...")
         processed_segment = audio_segment.set_frame_rate(target_sr).set_channels(1)
         # Use more robust export parameters
         processed_segment.export(
-            temp_wav_path,
+            temp_wav_path, 
             format="wav",
             parameters=[
-                "-codec:a",
-                "pcm_s16le",  # Fix the typo: was pcm_s0le, should be pcm_s16le
-                "-ar",
-                str(target_sr),  # Set sample rate explicitly
-                "-ac",
-                "1",  # Set mono explicitly
-            ],
+                "-codec:a", "pcm_s16le",  # Fix the typo: was pcm_s0le, should be pcm_s16le
+                "-ar", str(target_sr),    # Set sample rate explicitly
+                "-ac", "1"                # Set mono explicitly
+            ]
         )
-
-        logger.info(
-            f"Fallback: Converted {os.path.basename(file_path)} to temporary WAV for robust loading."
-        )
-
+        
+        logger.info(f"Fallback: Converted {os.path.basename(file_path)} to temporary WAV for robust loading.")
+        
         # Load the safe, downsampled WAV file
-        audio, sr = librosa.load(
-            temp_wav_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT
-        )
+        audio, sr = librosa.load(temp_wav_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT)
+        
         # Final check on the fallback's output for silence or emptiness
         if audio is None or audio.size == 0 or not np.any(audio):
-            logger.error(
-                f"Fallback method also resulted in an empty or silent audio signal for {os.path.basename(file_path)}."
-            )
+            logger.error(f"Fallback method also resulted in an empty or silent audio signal for {os.path.basename(file_path)}.")
             return None, None
-
+            
         return audio, sr
 
     except Exception as e_fallback:
-        logger.error(
-            f"Fallback loading method also failed for {os.path.basename(file_path)}: {e_fallback}"
-        )
+        logger.error(f"Fallback loading method also failed for {os.path.basename(file_path)}: {e_fallback}")
         return None, None
 
     finally:
@@ -250,7 +290,7 @@ def get_inference_models() -> dict[
         "relaxed",
         "sad",
     ],
-    tf.Session,
+    ort.InferenceSession,
 ]:
     global MODEL_SESSIONS
 
@@ -267,23 +307,19 @@ def get_inference_models() -> dict[
         "relaxed": RELAXED_MODEL_PATH,
         "sad": SAD_MODEL_PATH,
     }
+
     sessions = dict()
     for model_type, model_path in model_paths.items():
-        model_graph = tf.Graph()
-        with model_graph.as_default():
-            graph_def = tf.GraphDef()
-            with tf.gfile.GFile(model_path, "rb") as f:
-                graph_def.ParseFromString(f.read())
-            tf.import_graph_def(graph_def, name="")
-
-            sess = tf.Session(graph=model_graph)
-            sessions[model_type] = sess
+        sess = ort.InferenceSession(
+            model_path,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+        sessions[model_type] = sess
     MODEL_SESSIONS = sessions
 
     return MODEL_SESSIONS
 
 
-# noinspection PyUnresolvedReferences
 def analyze_track(file_path):
     """
     Analyzes a single track. This function is now completely self-contained to ensure
@@ -297,67 +333,47 @@ def analyze_track(file_path):
     audio, sr = robust_load_audio_with_fallback(file_path, target_sr=16000)
 
     if audio is None or not np.any(audio) or audio.size == 0:
-        logger.warning(
-            f"Could not load a valid audio signal for {os.path.basename(file_path)} after all attempts. Skipping track."
-        )
+        logger.warning(f"Could not load a valid audio signal for {os.path.basename(file_path)} after all attempts. Skipping track.")
         return None, None
 
     tempo, _ = librosa.beat.beat_track(y=audio, sr=sr)
-    average_energy = np.mean(librosa_feature.rms(y=audio))
-
+    average_energy = np.mean(librosa.feature.rms(y=audio))
+    
     # Improved key/scale detection
-    chroma = librosa_feature.chroma_stft(y=audio, sr=sr)
+    chroma = librosa.feature.chroma_stft(y=audio, sr=sr)
     chroma_mean = np.mean(chroma, axis=1)
-    key_vals = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
+    key_vals = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'A#', 'B']
     major_profile = np.array([1, 0, 1, 0, 1, 1, 0, 1, 0, 1, 0, 1])
     minor_profile = np.array([1, 0, 1, 1, 0, 1, 0, 1, 1, 0, 1, 0])
-
-    major_correlations = np.array(
-        [np.corrcoef(chroma_mean, np.roll(major_profile, i))[0, 1] for i in range(12)]
-    )
-    minor_correlations = np.array(
-        [np.corrcoef(chroma_mean, np.roll(minor_profile, i))[0, 1] for i in range(12)]
-    )
+    
+    major_correlations = np.array([np.corrcoef(chroma_mean, np.roll(major_profile, i))[0, 1] for i in range(12)])
+    minor_correlations = np.array([np.corrcoef(chroma_mean, np.roll(minor_profile, i))[0, 1] for i in range(12)])
 
     major_key_idx = np.argmax(major_correlations)
     minor_key_idx = np.argmax(minor_correlations)
 
     if major_correlations[major_key_idx] > minor_correlations[minor_key_idx]:
         musical_key = key_vals[major_key_idx]
-        scale = "major"
+        scale = 'major'
     else:
         musical_key = key_vals[minor_key_idx]
-        scale = "minor"
+        scale = 'minor'
 
-    # --- 2. Prepare Spectrograms ---
+
+    # --- 2. Prepare Spectrograms --- 
     try:
         # Using the spectrogram settings confirmed to work for the main model
         n_mels, hop_length, n_fft, frame_size = 96, 256, 512, 187
-        mel_spec = librosa_feature.melspectrogram(
-            y=audio,
-            sr=sr,
-            n_fft=n_fft,
-            hop_length=hop_length,
-            n_mels=n_mels,
-            window="hann",
-            center=False,
-            power=2.0,
-            norm="slaney",
-            htk=False,
-        )
+        mel_spec = librosa.feature.melspectrogram(y=audio, sr=sr, n_fft=n_fft, hop_length=hop_length, n_mels=n_mels, window='hann', center=False, power=2.0, norm='slaney', htk=False)
+
 
         log_mel_spec = np.log10(1 + 10000 * mel_spec)
 
-        spec_patches = [
-            log_mel_spec[:, i : i + frame_size]
-            for i in range(0, log_mel_spec.shape[1] - frame_size + 1, frame_size)
-        ]
+        spec_patches = [log_mel_spec[:, i:i+frame_size] for i in range(0, log_mel_spec.shape[1] - frame_size + 1, frame_size)]
         if not spec_patches:
-            logger.warning(
-                f"Track too short to create spectrogram patches: {os.path.basename(file_path)}"
-            )
+            logger.warning(f"Track too short to create spectrogram patches: {os.path.basename(file_path)}")
             return None, None
-
+        
         transposed_patches = np.array(spec_patches).transpose(0, 2, 1)
 
         # =================================================================
@@ -371,40 +387,20 @@ def analyze_track(file_path):
         # =================================================================
 
     except Exception as e:
-        logger.error(
-            f"Spectrogram creation failed for {os.path.basename(file_path)}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"Spectrogram creation failed for {os.path.basename(file_path)}: {e}", exc_info=True)
         return None, None
 
     # --- 3. Run Main Models (Embedding and Prediction) ---
     try:
-        # fetch and run embedding model
-        sess = models["embedding"]
-        # Use the corrected float32 patches
-        embedding_feed_dict = {
-            DEFINED_TENSOR_NAMES["embedding"]["input"]: final_patches
-        }
-        embeddings_per_patch = run_inference(
-            sess, embedding_feed_dict, DEFINED_TENSOR_NAMES["embedding"]["output"]
-        )
+        # Fetch and run embedding model (ONNX)
+        embedding_sess = models["embedding"]
+        embedding_feed_dict = {DEFINED_TENSOR_NAMES['embedding']['input']: final_patches}
+        embeddings_per_patch = run_inference(embedding_sess, embedding_feed_dict, DEFINED_TENSOR_NAMES['embedding']['output'])
 
         # Load and run prediction model
-        sess = models["prediction"]
-        prediction_feed_dict = {
-            DEFINED_TENSOR_NAMES["prediction"]["input"]: embeddings_per_patch,
-            "saver_filename:0": "",
-        }
-        mood_predictions_raw = run_inference(
-            sess, prediction_feed_dict, DEFINED_TENSOR_NAMES["prediction"]["output"]
-        )
-
-        if isinstance(mood_predictions_raw, bytes):
-            proto = tensor_pb2.TensorProto()
-            proto.ParseFromString(mood_predictions_raw)
-            mood_logits = tensor_util.MakeNdarray(proto)
-        else:
-            mood_logits = mood_predictions_raw
+        prediction_sess = models["prediction"]
+        prediction_feed_dict = {DEFINED_TENSOR_NAMES['prediction']['input']: embeddings_per_patch}
+        mood_logits = run_inference(prediction_sess, prediction_feed_dict, DEFINED_TENSOR_NAMES['prediction']['output'])
 
         averaged_logits = np.mean(mood_logits, axis=0)
         # Apply sigmoid to convert raw model outputs (logits) into probabilities
@@ -416,10 +412,7 @@ def analyze_track(file_path):
         }
 
     except Exception as e:
-        logger.error(
-            f"Main model inference failed for {os.path.basename(file_path)}: {e}",
-            exc_info=True,
-        )
+        logger.error(f"Main model inference failed for {os.path.basename(file_path)}: {e}", exc_info=True)
         return None, None
 
     # --- 4. Run Secondary Models ---
@@ -428,49 +421,33 @@ def analyze_track(file_path):
     for key in ["danceable", "aggressive", "happy", "party", "relaxed", "sad"]:
         try:
             # noinspection PyTypeChecker
-            sess = models[key]  # typing: ignore
+            other_sess = models[key]  # typing: ignore
             feed_dict = {DEFINED_TENSOR_NAMES[key]["input"]: embeddings_per_patch}
+            probabilities_per_patch = run_inference(other_sess, feed_dict, DEFINED_TENSOR_NAMES[key]['output'])
 
-            probabilities_raw = run_inference(
-                sess, feed_dict, DEFINED_TENSOR_NAMES[key]["output"]
-            )
-
-            if isinstance(probabilities_raw, bytes):
-                proto = tensor_pb2.TensorProto()
-                proto.ParseFromString(probabilities_raw)
-                probabilities_per_patch = tensor_util.MakeNdarray(proto)
-            else:
-                probabilities_per_patch = probabilities_raw
-
-            if (
-                probabilities_per_patch.ndim == 2
-                and probabilities_per_patch.shape[1] == 2
-            ):
-                # Using the CLASS_INDEX_MAP to select the correct probability
-                positive_class_index = CLASS_INDEX_MAP.get(key, 0)
-                class_probs = probabilities_per_patch[:, positive_class_index]
-                other_predictions[key] = float(np.mean(class_probs))
-            else:
+            if probabilities_per_patch is None:
                 other_predictions[key] = 0.0
+            else:
+                if isinstance(probabilities_per_patch, np.ndarray) and probabilities_per_patch.ndim == 2 and probabilities_per_patch.shape[1] == 2:
+                    # Using the CLASS_INDEX_MAP to select the correct probability
+                    positive_class_index = CLASS_INDEX_MAP.get(key, 0)
+                    class_probs = probabilities_per_patch[:, positive_class_index]
+                    other_predictions[key] = float(np.mean(class_probs))
+                else:
+                    other_predictions[key] = 0.0
 
         except Exception as e:
-            logger.error(
-                f"Error predicting '{key}' for {os.path.basename(file_path)}: {e}",
-                exc_info=True,
-            )
+            logger.error(f"Error predicting '{key}' for {os.path.basename(file_path)}: {e}", exc_info=True)
             other_predictions[key] = 0.0
 
     # --- 5. Final Aggregation for Storage ---
     processed_embeddings = np.mean(embeddings_per_patch, axis=0)
 
     return {
-        "tempo": float(tempo),
-        "key": musical_key,
-        "scale": scale,
-        "moods": moods,
-        "energy": float(average_energy),
-        **other_predictions,
+        "tempo": float(tempo), "key": musical_key, "scale": scale,
+        "moods": moods, "energy": float(average_energy), **other_predictions
     }, processed_embeddings
+
 
 
 # --- RQ Task Definitions ---
@@ -495,89 +472,47 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
     current_task_id = current_job.id if current_job else str(uuid.uuid4())
 
     with app.app_context():
-        initial_details = {
-            "album_name": album_name,
-            "log": [
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Album analysis task started."
-            ],
-        }
-        save_task_status(
-            current_task_id,
-            "album_analysis",
-            TASK_STATUS_STARTED,
-            parent_task_id=parent_task_id,
-            sub_type_identifier=album_id,
-            progress=0,
-            details=initial_details,
-        )
+        initial_details = {"album_name": album_name, "log": [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Album analysis task started."]}
+        save_task_status(current_task_id, "album_analysis", TASK_STATUS_STARTED, parent_task_id=parent_task_id, sub_type_identifier=album_id, progress=0, details=initial_details)
         tracks_analyzed_count, tracks_skipped_count, current_progress_val = 0, 0, 0
         current_task_logs = initial_details["log"]
 
-        def log_and_update_album_task(message, _progress, **kwargs):
+        def log_and_update_album_task(message, progress, **kwargs):
             nonlocal current_progress_val, current_task_logs
-            current_progress_val = _progress
+            current_progress_val = progress
             logger.info(f"[AlbumTask-{current_task_id}-{album_name}] {message}")
             db_details = {"album_name": album_name, **kwargs}
             log_entry = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-            task_state = kwargs.get("task_state", TASK_STATUS_PROGRESS)
+            task_state = kwargs.get('task_state', TASK_STATUS_PROGRESS)
 
-            if (
-                task_state in [TASK_STATUS_FAILURE, TASK_STATUS_REVOKED]
-                or task_state != TASK_STATUS_SUCCESS
-            ):
+            if task_state in [TASK_STATUS_FAILURE, TASK_STATUS_REVOKED] or task_state != TASK_STATUS_SUCCESS:
                 current_task_logs.append(log_entry)
                 db_details["log"] = current_task_logs
             else:
-                db_details["log"] = [
-                    f"Task completed successfully. Final status: {message}"
-                ]
-
+                db_details["log"] = [f"Task completed successfully. Final status: {message}"]
+            
             if current_job:
-                current_job.meta.update(
-                    {"progress": _progress, "status_message": message}
-                )
+                current_job.meta.update({'progress': progress, 'status_message': message})
                 current_job.save_meta()
-            save_task_status(
-                current_task_id,
-                "album_analysis",
-                task_state,
-                parent_task_id=parent_task_id,
-                sub_type_identifier=album_id,
-                progress=_progress,
-                details=db_details,
-            )
+            save_task_status(current_task_id, "album_analysis", task_state, parent_task_id=parent_task_id, sub_type_identifier=album_id, progress=progress, details=db_details)
 
         try:
             log_and_update_album_task(f"Fetching tracks for album: {album_name}", 5)
             # MODIFIED: Call to get_tracks_from_album no longer needs server parameters.
             tracks = get_tracks_from_album(album_id)
             if not tracks:
-                log_and_update_album_task(
-                    f"No tracks found for album: {album_name}",
-                    100,
-                    task_state=TASK_STATUS_SUCCESS,
-                )
-                return {
-                    "status": "SUCCESS",
-                    "message": f"No tracks in album {album_name}",
-                    "tracks_analyzed": 0,
-                }
+                log_and_update_album_task(f"No tracks found for album: {album_name}", 100, task_state=TASK_STATUS_SUCCESS)
+                return {"status": "SUCCESS", "message": f"No tracks in album {album_name}", "tracks_analyzed": 0}
 
             def get_existing_track_ids(track_ids):
-                if not track_ids:
-                    return set()
+                if not track_ids: return set()
                 with get_db() as conn, conn.cursor() as cur:
                     # MODIFIED: Cast the integer track IDs to TEXT for the database query.
-                    track_ids_as_strings = [str(track_id) for track_id in track_ids]
-                    cur.execute(
-                        "SELECT s.item_id FROM score s JOIN embedding e ON s.item_id = e.item_id WHERE s.item_id IN %s AND s.other_features IS NOT NULL AND s.energy IS NOT NULL AND s.mood_vector IS NOT NULL AND s.tempo IS NOT NULL",
-                        (tuple(track_ids_as_strings),),
-                    )
+                    track_ids_as_strings = [str(id) for id in track_ids]
+                    cur.execute("SELECT s.item_id FROM score s JOIN embedding e ON s.item_id = e.item_id WHERE s.item_id IN %s AND s.other_features IS NOT NULL AND s.energy IS NOT NULL AND s.mood_vector IS NOT NULL AND s.tempo IS NOT NULL", (tuple(track_ids_as_strings),))
                     return {row[0] for row in cur.fetchall()}
 
-            existing_track_ids_set = get_existing_track_ids(
-                [str(t["Id"]) for t in tracks]
-            )
+            existing_track_ids_set = get_existing_track_ids( [str(t['Id']) for t in tracks])
             total_tracks_in_album = len(tracks)
 
             active_inference_jobs = {}
@@ -589,29 +524,14 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
 
                 if current_job:
                     task_info = get_task_info_from_db(current_task_id)
-                    parent_info = (
-                        get_task_info_from_db(parent_task_id)
-                        if parent_task_id
-                        else None
-                    )
-                    if (task_info and task_info.get("status") == "REVOKED") or (
-                        parent_info
-                        and parent_info.get("status") in ["REVOKED", "FAILURE"]
-                    ):
-                        log_and_update_album_task(
-                            f"Stopping album analysis for '{album_name}' due to parent/self revocation.",
-                            current_progress_val,
-                            task_state=TASK_STATUS_REVOKED,
-                        )
+                    parent_info = get_task_info_from_db(parent_task_id) if parent_task_id else None
+                    if (task_info and task_info.get('status') == 'REVOKED') or (parent_info and parent_info.get('status') in ['REVOKED', 'FAILURE']):
+                        log_and_update_album_task(f"Stopping album analysis for '{album_name}' due to parent/self revocation.", current_progress_val, task_state=TASK_STATUS_REVOKED)
                         return {"status": "REVOKED"}
 
                 track_name_full = f"{item_name} by {item_album_artist}"
                 progress = 10 + int(85 * (idx / float(total_tracks_in_album)))
-                log_and_update_album_task(
-                    f"Analyzing track: {track_name_full} ({idx}/{total_tracks_in_album})",
-                    progress,
-                    current_track_name=track_name_full,
-                )
+                log_and_update_album_task(f"Analyzing track: {track_name_full} ({idx}/{total_tracks_in_album})", progress, current_track_name=track_name_full)
 
                 if str(item_id) in existing_track_ids_set:
                     tracks_skipped_count += 1
@@ -715,12 +635,8 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                     other_features=other_features,
                 )
 
-                logger.info(
-                    f"SUCCESSFULLY ANALYZED '{track_name_full}' (ID: {item_id}):"
-                )
-                logger.info(
-                    f"  - Tempo: {analysis_tempo:.2f}, Energy: {analysis_energy:.4f}, Key: {analysis_key} {analysis_scale}"
-                )
+                logger.info(f"SUCCESSFULLY ANALYZED '{track_name_full}' (ID: {item_id}):")
+                logger.info(f"  - Tempo: {analysis_tempo:.2f}, Energy: {analysis_energy:.4f}, Key: {analysis_key} {analysis_scale}")
                 logger.info(f"  - Top Moods: {top_moods}")
                 logger.info(f"  - Other Features: {other_features}")
                 tracks_analyzed_count += 1
@@ -731,63 +647,24 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 if path and os.path.exists(path):
                     os.remove(path)
 
-            summary = {
-                "tracks_analyzed": tracks_analyzed_count,
-                "tracks_skipped": tracks_skipped_count,
-                "total_tracks_in_album": total_tracks_in_album,
-            }
-            log_and_update_album_task(
-                f"Album '{album_name}' analysis complete.",
-                100,
-                task_state=TASK_STATUS_SUCCESS,
-                final_summary_details=summary,
-            )
+            summary = {"tracks_analyzed": tracks_analyzed_count, "tracks_skipped": tracks_skipped_count, "total_tracks_in_album": total_tracks_in_album}
+            log_and_update_album_task(f"Album '{album_name}' analysis complete.", 100, task_state=TASK_STATUS_SUCCESS, final_summary_details=summary)
             return {"status": "SUCCESS", **summary}
 
         except OperationalError as e:
-            logger.error(
-                f"Database connection error during album analysis {album_id}: {e}. This job will be retried.",
-                exc_info=True,
-            )
-            log_and_update_album_task(
-                f"Database connection failed for album '{album_name}'. Retrying...",
-                current_progress_val,
-                task_state=TASK_STATUS_FAILURE,
-                final_summary_details={
-                    "error": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-            )
+            logger.error(f"Database connection error during album analysis {album_id}: {e}. This job will be retried.", exc_info=True)
+            log_and_update_album_task(f"Database connection failed for album '{album_name}'. Retrying...", current_progress_val, task_state=TASK_STATUS_FAILURE, final_summary_details={"error": str(e), "traceback": traceback.format_exc()})
             raise
         except Exception as e:
             logger.critical(f"Album analysis {album_id} failed: {e}", exc_info=True)
-            log_and_update_album_task(
-                f"Failed to analyze album '{album_name}': {e}",
-                current_progress_val,
-                task_state=TASK_STATUS_FAILURE,
-                final_summary_details={
-                    "error": str(e),
-                    "traceback": traceback.format_exc(),
-                },
-            )
+            log_and_update_album_task(f"Failed to analyze album '{album_name}': {e}", current_progress_val, task_state=TASK_STATUS_FAILURE, final_summary_details={"error": str(e), "traceback": traceback.format_exc()})
             raise
 
 
 # MODIFIED: Removed jellyfin_url, jellyfin_user_id, jellyfin_token from signature.
 def run_analysis_task(num_recent_albums, top_n_moods):
     from app import app
-    from app_helper import (
-        TASK_STATUS_FAILURE,
-        TASK_STATUS_PROGRESS,
-        TASK_STATUS_REVOKED,
-        TASK_STATUS_STARTED,
-        TASK_STATUS_SUCCESS,
-        get_db,
-        get_task_info_from_db,
-        redis_conn,
-        rq_queue_default,
-        save_task_status,
-    )
+    from app_helper import (redis_conn, get_db, rq_queue_default, save_task_status, get_task_info_from_db, TASK_STATUS_STARTED, TASK_STATUS_PROGRESS, TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED)
 
     current_job = get_current_job(redis_conn)
     current_task_id = current_job.id if current_job else str(uuid.uuid4())
@@ -798,71 +675,35 @@ def run_analysis_task(num_recent_albums, top_n_moods):
             num_recent_albums = 0
 
         task_info = get_task_info_from_db(current_task_id)
-        if task_info and task_info.get("status") in [
-            TASK_STATUS_SUCCESS,
-            TASK_STATUS_FAILURE,
-            TASK_STATUS_REVOKED,
-        ]:
-            return {
-                "status": task_info.get("status"),
-                "message": "Task already in terminal state.",
-            }
+        if task_info and task_info.get('status') in [TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED]:
+            return {"status": task_info.get('status'), "message": "Task already in terminal state."}
+        
+        checked_album_ids = set(json.loads(task_info.get('details', '{}')).get('checked_album_ids', [])) if task_info else set()
+        
+        initial_details = {"message": "Fetching albums...", "log": [f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Main analysis task started."]}
 
-        checked_album_ids = (
-            set(json.loads(task_info.get("details", "{}")).get("checked_album_ids", []))
-            if task_info
-            else set()
-        )
-
-        initial_details = {
-            "message": "Fetching albums...",
-            "log": [
-                f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Main analysis task started."
-            ],
-        }
-
-        save_task_status(
-            current_task_id,
-            "main_analysis",
-            TASK_STATUS_STARTED,
-            progress=0,
-            details=initial_details,
-        )
+        save_task_status(current_task_id, "main_analysis", TASK_STATUS_STARTED, progress=0, details=initial_details)
         current_progress = 0
         current_task_logs = initial_details["log"]
 
-        def log_and_update_main(message, _progress, **kwargs):
+        def log_and_update_main(message, progress, **kwargs):
             nonlocal current_progress, current_task_logs
-            current_progress = _progress
+            current_progress = progress
             logger.info(f"[MainAnalysisTask-{current_task_id}] {message}")
             details = {**kwargs, "status_message": message}
             log_entry = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-            task_state = kwargs.get("task_state", TASK_STATUS_PROGRESS)
-
+            task_state = kwargs.get('task_state', TASK_STATUS_PROGRESS)
+            
             if task_state != TASK_STATUS_SUCCESS:
                 current_task_logs.append(log_entry)
                 details["log"] = current_task_logs
             else:
-                details["log"] = [
-                    f"Task completed successfully. Final status: {message}"
-                ]
+                details["log"] = [f"Task completed successfully. Final status: {message}"]
 
             if current_job:
-                current_job.meta.update(
-                    {
-                        "progress": _progress,
-                        "status_message": message,
-                        "details": details,
-                    }
-                )
+                current_job.meta.update({'progress': progress, 'status_message': message, 'details':details})
                 current_job.save_meta()
-            save_task_status(
-                current_task_id,
-                "main_analysis",
-                task_state,
-                progress=_progress,
-                details=details,
-            )
+            save_task_status(current_task_id, "main_analysis", task_state, progress=progress, details=details)
 
         try:
             log_and_update_main("🚀 Starting main analysis process...", 0)
@@ -870,136 +711,135 @@ def run_analysis_task(num_recent_albums, top_n_moods):
             # MODIFIED: Call to get_recent_albums no longer needs server parameters.
             all_albums = get_recent_albums(num_recent_albums)
             if not all_albums:
-                log_and_update_main(
-                    "⚠️ No new albums to analyze.",
-                    100,
-                    albums_found=0,
-                    task_state=TASK_STATUS_SUCCESS,
-                )
+                log_and_update_main("⚠️ No new albums to analyze.", 100, albums_found=0, task_state=TASK_STATUS_SUCCESS)
                 return {"status": "SUCCESS", "message": "No new albums to analyze."}
 
             total_albums_to_check = len(all_albums)
-            active_jobs = dict()
-            albums_skipped, albums_launched, albums_completed, last_rebuild_count = (
-                0,
-                0,
-                0,
-                0,
-            )
+            active_jobs, launched_jobs = {}, []
+            albums_skipped, albums_launched, albums_completed, last_rebuild_count = 0, 0, 0, 0
 
             def get_existing_track_ids(track_ids):
-                if not track_ids:
-                    return set()
+                if not track_ids: return set()
                 with get_db() as conn, conn.cursor() as cur:
                     # Convert integer track IDs to strings for database comparison
                     track_ids_as_strings = [str(track_id) for track_id in track_ids]
-                    cur.execute(
-                        "SELECT s.item_id FROM score s JOIN embedding e ON s.item_id = e.item_id WHERE s.item_id IN %s AND s.other_features IS NOT NULL AND s.energy IS NOT NULL AND s.mood_vector IS NOT NULL AND s.tempo IS NOT NULL",
-                        (tuple(track_ids_as_strings),),
-                    )
+                    cur.execute("SELECT s.item_id FROM score s JOIN embedding e ON s.item_id = e.item_id WHERE s.item_id IN %s AND s.other_features IS NOT NULL AND s.energy IS NOT NULL AND s.mood_vector IS NOT NULL AND s.tempo IS NOT NULL", (tuple(track_ids_as_strings),))
                     return {row[0] for row in cur.fetchall()}
 
             def monitor_and_clear_jobs():
+                """Monitor active RQ jobs and keep `albums_completed` in sync.
+
+                This function first tries to use RQ's Job.fetch to detect terminal jobs
+                (finished/failed/canceled). As a more reliable fallback it also queries
+                the database for child task records (which are updated by the child
+                job when it finishes) and uses that as the source of truth. This
+                helps in cases where RQ job state is not available or the worker
+                uses a different Redis namespace.
+                """
                 nonlocal albums_completed, last_rebuild_count
+                removed = 0
+
+                # First: try to detect terminal jobs via RQ
                 for job_id in list(active_jobs.keys()):
                     try:
-                        # **MODIFIED**: Added a try-except block to handle Redis timeouts gracefully.
-                        _job = Job.fetch(job_id, connection=redis_conn)
-                        if _job.is_finished or _job.is_failed or _job.is_canceled:
+                        job = Job.fetch(job_id, connection=redis_conn)
+                        if job.is_finished or job.is_failed or job.is_canceled:
                             del active_jobs[job_id]
-                            albums_completed += 1
+                            removed += 1
                     except NoSuchJobError:
-                        logger.warning(
-                            f"Job {job_id} not found in Redis. Assuming complete."
-                        )
-                        del active_jobs[job_id]
-                        albums_completed += 1
+                        logger.debug(f"Job {job_id} not found in RQ. Will reconcile with DB status.")
+                        # Do not increment removed here; we'll reconcile via DB below.
                     except RedisTimeoutError:
-                        logger.warning(
-                            f"Redis timeout while fetching job {job_id}. Will retry on next loop."
-                        )
-                        # We don't remove the job, we'll try fetching it again later.
+                        logger.warning(f"Redis timeout while fetching job {job_id}. Will retry on next loop.")
                         continue
-                    except Exception as exc:
-                        # Catch-all to avoid a single unexpected failure stopping the monitor loop.
-                        # Don't remove the job here because the fetch failed unexpectedly (network, auth, etc.).
-                        logger.warning(
-                            f"Unexpected error while fetching job {job_id}: {exc}. Will retry on next loop.",
-                            exc_info=True,
-                        )
+                    except Exception as e:
+                        logger.warning(f"Unexpected error while fetching job {job_id}: {e}. Will retry on next loop.", exc_info=True)
                         continue
 
-                if (
-                    albums_completed > last_rebuild_count
-                    and (albums_completed - last_rebuild_count)
-                    >= REBUILD_INDEX_BATCH_SIZE
-                ):
-                    log_and_update_main(
-                        f"Batch of {albums_completed - last_rebuild_count} albums complete. Rebuilding index...",
-                        current_progress,
-                    )
-                    # MODIFIED: Call the voyager index builder
+                if removed:
+                    albums_completed += removed
+
+                # Second: reconcile with DB child task statuses (authoritative)
+                try:
+                    from app_helper import get_child_tasks_from_db
+                    child_tasks = get_child_tasks_from_db(current_task_id)
+                    terminal_statuses = {TASK_STATUS_SUCCESS, TASK_STATUS_FAILURE, TASK_STATUS_REVOKED}
+                    db_completed = sum(1 for t in child_tasks if t.get('status') in terminal_statuses)
+
+                    if db_completed != albums_completed:
+                        logger.info(f"Reconciling albums_completed: RQ_count={albums_completed} DB_count={db_completed}")
+                        albums_completed = db_completed
+                        # Remove any active_jobs whose IDs are in DB terminal list
+                        terminal_ids = {t['task_id'] for t in child_tasks if t.get('status') in terminal_statuses}
+                        for job_id in list(active_jobs.keys()):
+                            if job_id in terminal_ids:
+                                try:
+                                    del active_jobs[job_id]
+                                except KeyError:
+                                    pass
+                except Exception as e:
+                    logger.error(f"Failed to reconcile child tasks from DB: {e}", exc_info=True)
+
+                # Rebuild index in batches as before
+                if albums_completed > last_rebuild_count and (albums_completed - last_rebuild_count) >= REBUILD_INDEX_BATCH_SIZE:
+                    log_and_update_main(f"Batch of {albums_completed - last_rebuild_count} albums complete. Rebuilding index and map...", current_progress)
                     build_and_store_voyager_index(get_db())
-                    redis_conn.publish("index-updates", "reload")
+                    # Also rebuild map projection
+                    try:
+                        from app_helper import build_and_store_map_projection
+                        build_and_store_map_projection('main_map')
+                    except Exception as e:
+                        logger.warning(f"Failed to build/store map projection during batch rebuild: {e}")
+                    try:
+                        redis_conn.publish('index-updates', 'reload')
+                    except Exception:
+                        logger.debug('Could not publish index-updates to redis during rebuild.')
                     last_rebuild_count = albums_completed
 
             for idx, album in enumerate(all_albums):
                 # Periodically check for completed jobs to update progress
                 monitor_and_clear_jobs()
 
-                if album["Id"] in checked_album_ids:
+                if album['Id'] in checked_album_ids:
                     albums_skipped += 1
                     continue
-
+                
                 while len(active_jobs) >= MAX_QUEUED_ANALYSIS_JOBS:
                     monitor_and_clear_jobs()
                     time.sleep(5)
-
+                
                 # MODIFIED: Call to get_tracks_from_album no longer needs server parameters.
-                tracks = get_tracks_from_album(album["Id"])
+                tracks = get_tracks_from_album(album['Id'])
                 # If no tracks returned, skip and log reason.
                 if not tracks:
                     albums_skipped += 1
-                    checked_album_ids.add(album["Id"])
-                    logger.info(
-                        f"Skipping album '{album.get('Name')}' (ID: {album.get('Id')}) - no tracks returned by media server."
-                    )
+                    checked_album_ids.add(album['Id'])
+                    logger.info(f"Skipping album '{album.get('Name')}' (ID: {album.get('Id')}) - no tracks returned by media server.")
                     continue
 
                 # If all tracks already exist in DB, skip and log how many.
                 try:
-                    existing_count = len(
-                        get_existing_track_ids([t["Id"] for t in tracks])
-                    )
+                    existing_count = len(get_existing_track_ids([t['Id'] for t in tracks]))
                 except Exception as e:
                     # Defensive: if DB check fails, log and continue to next album to avoid blocking the main loop.
-                    logger.warning(
-                        f"Failed to verify existing tracks for album '{album.get('Name')}' (ID: {album.get('Id')}): {e}"
-                    )
-                    checked_album_ids.add(album["Id"])
+                    logger.warning(f"Failed to verify existing tracks for album '{album.get('Name')}' (ID: {album.get('Id')}): {e}")
+                    checked_album_ids.add(album['Id'])
                     albums_skipped += 1
                     continue
 
                 if existing_count >= len(tracks):
                     albums_skipped += 1
-                    checked_album_ids.add(album["Id"])
-                    logger.info(
-                        f"Skipping album '{album.get('Name')}' (ID: {album.get('Id')}) - all {existing_count}/{len(tracks)} tracks already analyzed."
-                    )
+                    checked_album_ids.add(album['Id'])
+                    logger.info(f"Skipping album '{album.get('Name')}' (ID: {album.get('Id')}) - all {existing_count}/{len(tracks)} tracks already analyzed.")
                     continue
-
+                
                 # MODIFIED: Enqueue call for analyze_album_task now passes fewer arguments.
-                job = rq_queue_default.enqueue(
-                    "tasks.analysis.analyze_album_task",
-                    args=(album["Id"], album["Name"], top_n_moods, current_task_id),
-                    job_id=str(uuid.uuid4()),
-                    job_timeout=-1,
-                    retry=Retry(max=3),
-                )
+                job = rq_queue_default.enqueue('tasks.analysis.analyze_album_task', args=(album['Id'], album['Name'], top_n_moods, current_task_id), job_id=str(uuid.uuid4()), job_timeout=-1, retry=Retry(max=3))
                 active_jobs[job.id] = job
+                launched_jobs.append(job)
                 albums_launched += 1
-                checked_album_ids.add(album["Id"])
-
+                checked_album_ids.add(album['Id'])
+                
                 progress = 5 + int(85 * (idx / float(total_albums_to_check)))
                 status_message = f"Launched: {albums_launched}. Completed: {albums_completed}/{albums_launched}. Active: {len(active_jobs)}. Skipped: {albums_skipped}/{total_albums_to_check}."
                 log_and_update_main(
@@ -1007,34 +847,35 @@ def run_analysis_task(num_recent_albums, top_n_moods):
                     progress,
                     albums_to_process=albums_launched,
                     albums_skipped=albums_skipped,
-                    checked_album_ids=list(checked_album_ids),
+                    checked_album_ids=list(checked_album_ids)
                 )
-
+                
             # If we never enqueued any album jobs for the batch, warn operator so they can investigate.
             if albums_launched == 0 and albums_skipped == total_albums_to_check:
-                logger.warning(
-                    f"No albums were enqueued: all {total_albums_to_check} albums were skipped (no tracks or already analyzed). If unexpected, try running with num_recent_albums=0 to fetch more or inspect the media server responses and Spotify filtering."
-                )
+                logger.warning(f"No albums were enqueued: all {total_albums_to_check} albums were skipped (no tracks or already analyzed). If unexpected, try running with num_recent_albums=0 to fetch more or inspect the media server responses and Spotify filtering.")
 
             while active_jobs:
                 monitor_and_clear_jobs()
-                progress = 5 + int(
-                    85
-                    * (
-                        (albums_skipped + albums_completed)
-                        / float(total_albums_to_check)
-                    )
-                )
+                progress = 5 + int(85 * ((albums_skipped + albums_completed) / float(total_albums_to_check)))
                 status_message = f"Launched: {albums_launched}. Completed: {albums_completed}/{albums_launched}. Active: {len(active_jobs)}. Skipped: {albums_skipped}/{total_albums_to_check}. (Finalizing)"
-                log_and_update_main(
-                    status_message, progress, checked_album_ids=list(checked_album_ids)
-                )
+                log_and_update_main(status_message, progress, checked_album_ids=list(checked_album_ids))
                 time.sleep(5)
 
             log_and_update_main("Performing final index rebuild...", 95)
             # MODIFIED: Call the voyager index builder
             build_and_store_voyager_index(get_db())
-            redis_conn.publish("index-updates", "reload")
+            redis_conn.publish('index-updates', 'reload')
+
+            # Build and store the 2D map projection for the web map (best-effort)
+            try:
+                from app_helper import build_and_store_map_projection
+                built = build_and_store_map_projection('main_map')
+                if built:
+                    logger.info('Precomputed map projection built and stored.')
+                else:
+                    logger.info('Precomputed map projection build returned no data (no embeddings?).')
+            except Exception as e:
+                logger.warning(f"Failed to build/store precomputed map projection: {e}")
 
             final_message = f"Main analysis complete. Launched {albums_launched}, Skipped {albums_skipped}."
             log_and_update_main(final_message, 100, task_state=TASK_STATUS_SUCCESS)
@@ -1042,26 +883,11 @@ def run_analysis_task(num_recent_albums, top_n_moods):
             return {"status": "SUCCESS", "message": final_message}
 
         except OperationalError as e:
-            logger.critical(
-                f"FATAL ERROR: Main analysis task failed due to DB connection issue: {e}",
-                exc_info=True,
-            )
-            log_and_update_main(
-                "❌ Main analysis failed due to a database connection error. The task may be retried.",
-                current_progress,
-                task_state=TASK_STATUS_FAILURE,
-                error_message=str(e),
-                traceback=traceback.format_exc(),
-            )
+            logger.critical(f"FATAL ERROR: Main analysis task failed due to DB connection issue: {e}", exc_info=True)
+            log_and_update_main(f"❌ Main analysis failed due to a database connection error. The task may be retried.", current_progress, task_state=TASK_STATUS_FAILURE, error_message=str(e), traceback=traceback.format_exc())
             # Re-raise to allow RQ to handle retries if configured on the task itself
             raise
         except Exception as e:
             logger.critical(f"FATAL ERROR: Analysis failed: {e}", exc_info=True)
-            log_and_update_main(
-                f"❌ Main analysis failed: {e}",
-                current_progress,
-                task_state=TASK_STATUS_FAILURE,
-                error_message=str(e),
-                traceback=traceback.format_exc(),
-            )
+            log_and_update_main(f"❌ Main analysis failed: {e}", current_progress, task_state=TASK_STATUS_FAILURE, error_message=str(e), traceback=traceback.format_exc())
             raise

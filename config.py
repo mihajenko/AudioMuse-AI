@@ -2,7 +2,7 @@
 import os
 
 # --- Media Server Type ---
-MEDIASERVER_TYPE = os.environ.get("MEDIASERVER_TYPE", "jellyfin").lower() # Possible values: jellyfin, navidrome, lyrion, mpd
+MEDIASERVER_TYPE = os.environ.get("MEDIASERVER_TYPE", "jellyfin").lower() # Possible values: jellyfin, navidrome, lyrion, mpd, emby
 
 # --- Jellyfin and DB Constants (Read from Environment Variables first) ---
 
@@ -10,8 +10,27 @@ MEDIASERVER_TYPE = os.environ.get("MEDIASERVER_TYPE", "jellyfin").lower() # Poss
 JELLYFIN_URL = os.environ.get("JELLYFIN_URL", "http://your_jellyfin_url:8096") # Replace with your default URL
 JELLYFIN_USER_ID = os.environ.get("JELLYFIN_USER_ID", "your_default_user_id")  # Replace with a suitable default or handle missing case
 JELLYFIN_TOKEN = os.environ.get("JELLYFIN_TOKEN", "your_default_token")  # Replace with a suitable default or handle missing case
+
+# EMBY_USER_ID and JELLYFIN_TOKEN come from a Kubernetes Secret
+EMBY_URL = os.environ.get("EMBY_URL", "http://embymediaserver:8096") # Replace with your default URL
+EMBY_USER_ID = os.environ.get("EMBY_USER_ID", "your_default_user_id")  # Replace with a suitable default or handle missing case
+EMBY_TOKEN = os.environ.get("EMBY_TOKEN", "your_default_token")  # Replace with a suitable default or handle missing case
+
+
+# NEW: Allow specifying music libraries/folders for analysis across all media servers.
+# Comma-separated list of library/folder names or paths. If empty, all music libraries/folders are scanned.
+# For Lyrion: Use folder paths like "/music/myfolder"  
+# For Jellyfin/Navidrome: Use library/folder names
+MUSIC_LIBRARIES = os.environ.get("MUSIC_LIBRARIES", "") 
 TEMP_DIR = "/app/temp_audio"  # Always use /app/temp_audio
 HEADERS = {"X-Emby-Token": JELLYFIN_TOKEN}
+
+if MEDIASERVER_TYPE == "jellyfin":
+    HEADERS = {"X-Emby-Token": JELLYFIN_TOKEN}
+elif MEDIASERVER_TYPE == "emby":
+    HEADERS = {"X-Emby-Token": EMBY_TOKEN}
+else:
+    HEADERS = {}
 
 # --- Navidrome (Subsonic API) Constants ---
 # These are used only if MEDIASERVER_TYPE is "navidrome".
@@ -32,12 +51,14 @@ MPD_MUSIC_DIRECTORY = os.environ.get("MPD_MUSIC_DIRECTORY", "/var/lib/mpd/music"
 
 
 # --- General Constants (Read from Environment Variables where applicable) ---
-APP_VERSION = "v0.6.10-beta"
+APP_VERSION = "v0.7.9-beta"
 MAX_DISTANCE = 0.5
 MAX_SONGS_PER_CLUSTER = 0
 MAX_SONGS_PER_ARTIST = int(os.getenv("MAX_SONGS_PER_ARTIST", "3")) # Max songs per artist in similarity results and clustering
 # New: Default behavior for eliminating duplicates in similarity search. If param not passed to API, this is the default.
 SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT = os.environ.get("SIMILARITY_ELIMINATE_DUPLICATES_DEFAULT", "True").lower() == 'true'
+# Default behavior for radius similarity mode. Can be toggled via environment variable.
+SIMILARITY_RADIUS_DEFAULT = os.environ.get("SIMILARITY_RADIUS_DEFAULT", "True").lower() == 'true'
 NUM_RECENT_ALBUMS = int(os.getenv("NUM_RECENT_ALBUMS", "0")) # Convert to int
 TOP_N_PLAYLISTS = int(os.environ.get("TOP_N_PLAYLISTS", "8")) # *** NEW: Default for Top N diverse playlists ***
 MIN_PLAYLIST_SIZE_FOR_TOP_N = int(os.environ.get("MIN_PLAYLIST_SIZE_FOR_TOP_N", "20")) # Min songs for a playlist to be considered in the first pass of Top-N selection.
@@ -87,6 +108,11 @@ MAX_QUEUED_ANALYSIS_JOBS = int(os.environ.get("MAX_QUEUED_ANALYSIS_JOBS", "100")
 ITERATIONS_PER_BATCH_JOB = int(os.environ.get("ITERATIONS_PER_BATCH_JOB", "20")) # Number of clustering iterations per RQ batch job
 MAX_CONCURRENT_BATCH_JOBS = int(os.environ.get("MAX_CONCURRENT_BATCH_JOBS", "10")) # Max number of batch jobs to run concurrently
 DB_FETCH_CHUNK_SIZE = int(os.environ.get("DB_FETCH_CHUNK_SIZE", "1000")) # Chunk size for fetching full track data from DB in batch jobs
+
+# --- Clustering Batch Timeout and Failure Recovery ---
+CLUSTERING_BATCH_TIMEOUT_MINUTES = int(os.environ.get("CLUSTERING_BATCH_TIMEOUT_MINUTES", "60")) # Max time a batch can run before being considered failed
+CLUSTERING_MAX_FAILED_BATCHES = int(os.environ.get("CLUSTERING_MAX_FAILED_BATCHES", "10")) # Max number of failed batches before stopping
+CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS = int(os.environ.get("CLUSTERING_BATCH_CHECK_INTERVAL_SECONDS", "30")) # How often to check batch status
 
 # --- Batching Constants for Analysis ---
 REBUILD_INDEX_BATCH_SIZE = int(os.environ.get("REBUILD_INDEX_BATCH_SIZE", "10")) # Rebuild Voyager index after this many albums are analyzed.
@@ -185,7 +211,18 @@ POSTGRES_HOST = os.environ.get("POSTGRES_HOST", "postgres-service.playlist") # D
 POSTGRES_PORT = os.environ.get("POSTGRES_PORT", "5432")
 POSTGRES_DB = os.environ.get("POSTGRES_DB", "audiomusedb")
 
-DATABASE_URL = f"postgresql://{POSTGRES_USER}:{POSTGRES_PASSWORD}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+# Allow an explicit DATABASE_URL to override construction (useful for docker-compose or direct env override)
+from urllib.parse import quote
+
+# Percent-encode username and password to safely include special characters like '@' in the URI
+_pg_user_esc = quote(POSTGRES_USER, safe='')
+_pg_pass_esc = quote(POSTGRES_PASSWORD, safe='')
+
+# If DATABASE_URL is set in the environment, prefer it; otherwise build one using the escaped credentials
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    f"postgresql://{_pg_user_esc}:{_pg_pass_esc}@{POSTGRES_HOST}:{POSTGRES_PORT}/{POSTGRES_DB}"
+)
 
 # --- AI User for Chat SQL Execution ---
 AI_CHAT_DB_USER_NAME = os.environ.get("AI_CHAT_DB_USER_NAME", "ai_user")
@@ -202,8 +239,8 @@ MOOD_LABELS = [
 
 TOP_N_MOODS = 5
 TOP_N_OTHER_FEATURES = int(os.environ.get("TOP_N_OTHER_FEATURES", "2")) # Number of top "other features" to consider for clustering vector
-EMBEDDING_MODEL_PATH = "/app/model/msd-musicnn-1.pb"
-PREDICTION_MODEL_PATH = "/app/model/msd-msd-musicnn-1.pb"
+EMBEDDING_MODEL_PATH = "/app/model/msd-musicnn-1.onnx"
+PREDICTION_MODEL_PATH = "/app/model/msd-msd-musicnn-1.onnx"
 EMBEDDING_DIMENSION = 200
 
 # --- Voyager Index Constants ---
@@ -225,15 +262,35 @@ PATH_CANDIDATES_PER_STEP = int(os.environ.get("PATH_CANDIDATES_PER_STEP", "25"))
 # Multiplier for the core number of steps (Lcore) to generate more backbone centroids.
 PATH_LCORE_MULTIPLIER = int(os.environ.get("PATH_LCORE_MULTIPLIER", "3"))
 
+# When True (default) the path generation attempts to produce exactly the requested
+# path length using centroid merging and backfilling. When False, the algorithm
+# will *not* perform centroid merging: it will attempt a single best pick per
+# centroid and skip centroids that don't yield a non-duplicate song (resulting
+# in potentially shorter paths). Can be overridden via env var PATH_FIX_SIZE.
+PATH_FIX_SIZE = os.environ.get("PATH_FIX_SIZE", "False").lower() == 'true'
+
+
+# --- Song Alchemy Defaults ---
+# Number of similar songs to return when creating the Alchemy result (default 100, max 200)
+ALCHEMY_DEFAULT_N_RESULTS = int(os.environ.get("ALCHEMY_DEFAULT_N_RESULTS", "100"))
+ALCHEMY_MAX_N_RESULTS = int(os.environ.get("ALCHEMY_MAX_N_RESULTS", "200"))
+# Temperature for probabilistic sampling in Song Alchemy (softmax temperature)
+ALCHEMY_TEMPERATURE = float(os.environ.get("ALCHEMY_TEMPERATURE", "1.0"))
+# Minimum distance from the subtract-centroid to keep a candidate (metric-dependent).
+# For angular (cosine-derived) distances this is in [0,1] where higher means more distant.
+ALCHEMY_SUBTRACT_DISTANCE = float(os.environ.get("ALCHEMY_SUBTRACT_DISTANCE", "0.2"))
+ALCHEMY_SUBTRACT_DISTANCE_ANGULAR = float(os.environ.get("ALCHEMY_SUBTRACT_DISTANCE_ANGULAR", "0.2"))
+ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN = float(os.environ.get("ALCHEMY_SUBTRACT_DISTANCE_EUCLIDEAN", "5.0"))
+
 
 # --- Other Essentia Model Paths ---
 # Paths for models used in predict_other_models (VGGish-based)
-DANCEABILITY_MODEL_PATH = os.environ.get("DANCEABILITY_MODEL_PATH", "/app/model/danceability-msd-musicnn-1.pb") # Example, adjust if different
-AGGRESSIVE_MODEL_PATH = os.environ.get("AGGRESSIVE_MODEL_PATH", "/app/model/mood_aggressive-msd-musicnn-1.pb")
-HAPPY_MODEL_PATH = os.environ.get("HAPPY_MODEL_PATH", "/app/model/mood_happy-msd-musicnn-1.pb")
-PARTY_MODEL_PATH = os.environ.get("PARTY_MODEL_PATH", "/app/model/mood_party-msd-musicnn-1.pb")
-RELAXED_MODEL_PATH = os.environ.get("RELAXED_MODEL_PATH", "/app/model/mood_relaxed-msd-musicnn-1.pb")
-SAD_MODEL_PATH = os.environ.get("SAD_MODEL_PATH", "/app/model/mood_sad-msd-musicnn-1.pb")
+DANCEABILITY_MODEL_PATH = os.environ.get("DANCEABILITY_MODEL_PATH", "/app/model/danceability-msd-musicnn-1.onnx") # Example, adjust if different
+AGGRESSIVE_MODEL_PATH = os.environ.get("AGGRESSIVE_MODEL_PATH", "/app/model/mood_aggressive-msd-musicnn-1.onnx")
+HAPPY_MODEL_PATH = os.environ.get("HAPPY_MODEL_PATH", "/app/model/mood_happy-msd-musicnn-1.onnx")
+PARTY_MODEL_PATH = os.environ.get("PARTY_MODEL_PATH", "/app/model/mood_party-msd-musicnn-1.onnx")
+RELAXED_MODEL_PATH = os.environ.get("RELAXED_MODEL_PATH", "/app/model/mood_relaxed-msd-musicnn-1.onnx")
+SAD_MODEL_PATH = os.environ.get("SAD_MODEL_PATH", "/app/model/mood_sad-msd-musicnn-1.onnx")
 
 # --- Energy Normalization Range ---
 ENERGY_MIN = float(os.getenv("ENERGY_MIN", "0.01"))
@@ -278,3 +335,24 @@ SAMPLING_PERCENTAGE_CHANGE_PER_RUN = float(os.getenv("SAMPLING_PERCENTAGE_CHANGE
 DUPLICATE_DISTANCE_THRESHOLD_COSINE = float(os.getenv("DUPLICATE_DISTANCE_THRESHOLD_COSINE", "0.01"))
 DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN = float(os.getenv("DUPLICATE_DISTANCE_THRESHOLD_EUCLIDEAN", "0.15"))
 DUPLICATE_DISTANCE_CHECK_LOOKBACK = int(os.getenv("DUPLICATE_DISTANCE_CHECK_LOOKBACK", "1"))
+
+# --- Mood Similarity Filtering ---
+# Threshold for mood similarity filtering. Lower values = stricter filtering (more similar moods required).
+# Range: 0.0 (identical moods only) to 1.0 (any mood difference allowed)
+MOOD_SIMILARITY_THRESHOLD = float(os.getenv("MOOD_SIMILARITY_THRESHOLD", "0.15"))
+# Enable or disable mood similarity filtering globally (default: disabled for radius experiments)
+MOOD_SIMILARITY_ENABLE = os.environ.get("MOOD_SIMILARITY_ENABLE", "False").lower() == 'true'
+
+# --- Enable Proxy Fix for Flask when behind a reverse proxy ---
+# Actually only one proxy is allowed between client and app.
+# Example nginx configuration:
+# location /audiomuseai/ {
+#   proxy_pass http://127.0.0.1:8000/;
+#   proxy_http_version 1.1;
+#   proxy_set_header X-Forwarded-Host myhostname;
+#   proxy_set_header X-Forwarded-For $remote_addr;
+#   proxy_set_header X-Forwarded-Port 443;
+#   proxy_set_header X-Forwarded-Proto https;
+#   proxy_set_header X-Forwarded-Prefix /audiomuseai;
+# }
+ENABLE_PROXY_FIX = os.environ.get("ENABLE_PROXY_FIX", "False").lower() == "true"

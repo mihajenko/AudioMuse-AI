@@ -3,7 +3,7 @@ from flask import Blueprint, jsonify, request, render_template
 import logging
 
 from tasks.sonic_fingerprint_manager import generate_sonic_fingerprint
-from tasks.mediaserver import resolve_jellyfin_user # Import the new resolver function
+from tasks.mediaserver import resolve_emby_jellyfin_user # Import the new resolver function
 from config import MEDIASERVER_TYPE, JELLYFIN_USER_ID, JELLYFIN_TOKEN, NAVIDROME_USER, NAVIDROME_PASSWORD # Import configs
 
 logger = logging.getLogger(__name__)
@@ -28,7 +28,7 @@ def sonic_fingerprint_page():
     """
     try:
         # The default user info will now be fetched by an API call from the frontend
-        return render_template('sonic_fingerprint.html', mediaserver_type=MEDIASERVER_TYPE)
+        return render_template('sonic_fingerprint.html', mediaserver_type=MEDIASERVER_TYPE, title = 'AudioMuse-AI - Sonic Fingerprint', active='sonic_fingerprint')
     except Exception as e:
          logger.error(f"Error rendering sonic_fingerprint.html: {e}", exc_info=True)
          return "Sonic Fingerprint page not implemented yet. Use the API at /api/sonic_fingerprint/generate"
@@ -157,7 +157,7 @@ def generate_sonic_fingerprint_endpoint():
                 return jsonify({"error": "Jellyfin API Token is required. Please provide one or set it in the server configuration."}), 400
 
             logger.info(f"Resolving Jellyfin user identifier: '{user_identifier}'")
-            resolved_user_id = resolve_jellyfin_user(user_identifier, token)
+            resolved_user_id = resolve_emby_jellyfin_user(user_identifier, token)
             if not resolved_user_id:
                 return jsonify({"error": f"Could not resolve Jellyfin user '{user_identifier}'."}), 400
             

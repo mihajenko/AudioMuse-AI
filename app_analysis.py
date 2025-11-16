@@ -30,7 +30,7 @@ def cleaning_page():
               type: string
     """
     from flask import render_template
-    return render_template('cleaning.html')
+    return render_template('cleaning.html', title = 'AudioMuse-AI - Database Cleaning', active='cleaning')
 
 @analysis_bp.route('/api/analysis/start', methods=['POST'])
 def start_analysis_endpoint():
@@ -88,6 +88,7 @@ def start_analysis_endpoint():
     # The task now gets these details from the central config.
     num_recent_albums = int(data.get('num_recent_albums', NUM_RECENT_ALBUMS))
     top_n_moods = int(data.get('top_n_moods', TOP_N_MOODS))
+    logger.info(f"Starting analysis request: num_recent_albums={num_recent_albums}, top_n_moods={top_n_moods}")
 
     job_id = str(uuid.uuid4())
 

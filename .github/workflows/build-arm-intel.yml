@@ -1,19 +1,24 @@
 # This workflow builds and tests a multi-architecture Docker image for both AMD64 and ARM64.
-# It triggers on pushes to the main and devel branches, as well as on version tags.
+# It triggers on pushes to the main, devel, and onnx branches, as well as on version tags.
 # Tags are automatically generated based on the triggering event:
 # - main branch -> 'latest'
 # - devel branch -> 'devel'
+# - onnx branch -> 'onnx'
 # - version tags (e.g., v1.2.3) -> version number (e.g., '1.2.3')
 
 name: Build, Test, and Push AudioMuse AI Docker Image INTEL and ARM
 
 on:
   push:
+    # We avoid triggering this workflow on direct pushes to `main` to prevent
+    # accidental builds from routine commits. Keep `devel` and `onnx` as before.
     branches:
-      - main          # Trigger for 'latest' tag
       - devel         # Trigger for 'devel' tag
+      - onnx          # New branch also triggers for 'onnx' tag
     tags:
       - 'v*.*.*'      # Trigger for version tags like v1.0.0
+  # Allow manual runs for debugging or manual pushes
+  workflow_dispatch:
 
 jobs:
   build-test-and-push:
@@ -57,10 +62,13 @@ jobs:
         with:
           images: ghcr.io/${{ steps.repo_name.outputs.name }}
           tags: |
-            # Set 'latest' tag for the main branch
-            type=raw,value=latest,enable=${{ github.ref == 'refs/heads/main' }}
-            # Use the branch name as the tag for other branches (e.g., 'devel')
-            type=ref,event=branch,enable=${{ github.ref != 'refs/heads/main' }}
+            # When a version tag (refs/tags/v*) is pushed, emit both 'latest' and the semver tag.
+            # We removed direct main branch triggers, so enable latest on tag pushes.
+            type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}
+            # Set 'devel' tag only for the devel branch
+            type=raw,value=devel,enable=${{ github.ref == 'refs/heads/devel' }}
+            # Set 'onnx' tag only for the onnx branch
+            type=raw,value=onnx,enable=${{ github.ref == 'refs/heads/onnx' }}
             # Use the version number for Git tags (e.g., v1.2.3 -> 1.2.3)
             type=semver,pattern={{version}}
 
