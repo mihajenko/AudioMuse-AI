@@ -217,6 +217,14 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
 
     # --- Fallback Method: Convert to WAV with pydub ---
     temp_wav_path = None
+    with NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav_file:
+        temp_wav_path = temp_wav_file.name
+
+    def delete_temp_file():
+        # Clean up the temporary WAV file if it was created
+        if temp_wav_path and os.path.exists(temp_wav_path):
+            os.remove(temp_wav_path)
+
     try:
         # Check the audio content with pydub before converting
         # Use more robust parameters for problematic codecs
@@ -234,9 +242,6 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
         if len(audio_segment) == 0:
             logger.error(f"Pydub loaded a zero-duration audio segment from {os.path.basename(file_path)}. The file is likely corrupt or empty.")
             return None, None
-
-        with NamedTemporaryFile(suffix=".wav", delete=False) as temp_wav_file:
-            temp_wav_path = temp_wav_file.name
         
         # --- MEMORY OPTIMIZATION FOR LARGE FILES ---
         # Resample and convert to mono during export to create a much smaller temp file.
@@ -245,7 +250,7 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
         processed_segment = audio_segment.set_frame_rate(target_sr).set_channels(1)
         # Use more robust export parameters
         processed_segment.export(
-            temp_wav_path, 
+            temp_wav_path,
             format="wav",
             parameters=[
                 "-codec:a", "pcm_s16le",  # Fix the typo: was pcm_s0le, should be pcm_s16le
@@ -253,26 +258,27 @@ def robust_load_audio_with_fallback(file_path, target_sr=16000):
                 "-ac", "1"                # Set mono explicitly
             ]
         )
-        
-        logger.info(f"Fallback: Converted {os.path.basename(file_path)} to temporary WAV for robust loading.")
-        
         # Load the safe, downsampled WAV file
-        audio, sr = librosa.load(temp_wav_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT)
-        
-        # Final check on the fallback's output for silence or emptiness
-        if audio is None or audio.size == 0 or not np.any(audio):
-            logger.error(f"Fallback method also resulted in an empty or silent audio signal for {os.path.basename(file_path)}.")
-            return None, None
-            
-        return audio, sr
+        audio, sr = librosa.load(
+            temp_wav_path, sr=target_sr, mono=True, duration=AUDIO_LOAD_TIMEOUT
+        )
+
+        logger.info(f"Fallback: Converted {os.path.basename(file_path)} to temporary WAV for robust loading.")
 
     except Exception as e_fallback:
         logger.error(f"Fallback loading method also failed for {os.path.basename(file_path)}: {e_fallback}")
+        delete_temp_file()
         return None, None
-    finally:
-        # Clean up the temporary WAV file if it was created
-        if temp_wav_path and os.path.exists(temp_wav_path):
-            os.remove(temp_wav_path)
+
+    # Final check on the fallback's output for silence or emptiness
+    if audio is None or audio.size == 0 or not np.any(audio):
+        logger.error(
+            f"Fallback method also resulted in an empty or silent audio signal for {os.path.basename(file_path)}."
+        )
+        return None, None
+
+    delete_temp_file()
+    return audio, sr
 
 
 MODEL_SESSIONS = None
@@ -514,7 +520,7 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
             existing_track_ids_set = get_existing_track_ids( [str(t['Id']) for t in tracks])
             total_tracks_in_album = len(tracks)
 
-            active_inference_jobs = {}
+            active_inference_jobs = dict()
             for idx, item in enumerate(tracks, 1):
                 # TODO: validate this
                 item_id = item["Id"]
@@ -541,7 +547,6 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 if not path:
                     continue
 
-                job_items = item_id, item_name, item_album_artist
                 try:
                     job = rq_queue_track_analysis.enqueue(
                         "tasks.analysis.analyze_track",
@@ -552,10 +557,10 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                     )
                 except Exception as e:
                     logger.error(
-                        f"Failed to enqueue 'tasks.analysis.analyze_track' job for item '{item['Id']}': {e!r}."
+                        f"Failed to enqueue 'tasks.analysis.analyze_track' job for item '{item_id}': {e!r}."
                     )
                 else:
-                    active_inference_jobs[job.id] = job_items
+                    active_inference_jobs[job.id] = item_id, item_name, item_album_artist, path
 
             # Fetch job results
             while True:
@@ -590,7 +595,7 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                     continue
 
                 # Persist job results
-                item_id, item_name, item_album_artist = job_items
+                item_id, item_name, item_album_artist, path = job_items
                 track_name_full = f"{item_name} by {item_album_artist}"
 
                 analysis, processed_embedding = result.return_value
@@ -611,15 +616,19 @@ def analyze_album_task(album_id, album_name, top_n_moods, parent_task_id):
                 other_features = ",".join([f"{k}:{analysis.get(k, 0.0):.2f}" for k in OTHER_FEATURE_LABELS])
                 save_track_analysis_and_embedding(item_id, item_name, item_album_artist, analysis_tempo, analysis_key, analysis_scale, top_moods, processed_embedding, energy=analysis_energy, other_features=other_features)
 
+                # Delete the fucking file
+                if path and os.path.exists(path):
+                    os.remove(path)
+
                 logger.info(f"SUCCESSFULLY ANALYZED '{track_name_full}' (ID: {item_id}):")
                 logger.info(f"  - Tempo: {analysis_tempo:.2f}, Energy: {analysis_energy:.4f}, Key: {analysis_key} {analysis_scale}")
                 logger.info(f"  - Top Moods: {top_moods}")
                 logger.info(f"  - Other Features: {other_features}")
                 tracks_analyzed_count += 1
 
-            # Cleanup the temp audio files
-            for _, job in active_inference_jobs.items():
-                path = job.args[0]
+            # Cleanup the temp audio files if any left
+            for _, job_items in active_inference_jobs.items():
+                path = job_items[-1]
                 if path and os.path.exists(path):
                     os.remove(path)
 
